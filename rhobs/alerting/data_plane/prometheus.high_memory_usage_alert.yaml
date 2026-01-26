@@ -11,9 +11,14 @@ spec:
     rules:
     - alert: HighMemoryUsageAlert
       expr: |
-        (sum by(namespace,source_cluster) (namespace_container:container_memory_working_set_bytes) / sum by (namespace,source_cluster) (namespace_memory:kube_pod_container_resource_limits:sum * 100 > 90))
+        avg_over_time(
+          (
+            (kube_pod_container_resource_requests{container!="",namespace!~"(.*-tenant|.*-env|openshift-.*|kube-.*|default|tekton-ci|build-templates-e2e|konflux-ci|mintmaker)"}
+            / kube_pod_container_resource_limits{container!="",namespace!~"(.*-tenant|.*-env|openshift-.*|kube-.*|default|tekton-ci|build-templates-e2e|konflux-ci|mintmaker)"}) * 100
+          )[10m:1m]
+        ) > 95
 
-      for: 5m
+      for: 10m
       labels:
         severity: warning
       annotations:
