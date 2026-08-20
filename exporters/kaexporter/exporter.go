@@ -96,8 +96,8 @@ const (
 	defaultMaxRetryDelay     = 5000 // milliseconds
 	retryBackoffMultiplier   = 2.0
 
-	// maxGapFillAttempts limits gap-fill retries for truncated namespaces.
-	// With coldStartMaxItems=30,000, this allows up to 150,000 PLRs to be covered across 5 attempts.
+	// maxGapFillAttempts limits consecutive gap-fill failures or stalls.
+	// Resets to 0 when gap-fill makes progress (oldest timestamp moves backward).
 	maxGapFillAttempts = 5
 )
 
@@ -107,7 +107,67 @@ const (
 type nsBootstrapState struct {
 	Bootstrapped         bool   // true when namespace has complete 30-day data
 	OldestSeenCreationTS string // RFC3339 timestamp of oldest item seen (empty = no gap)
-	GapAttempts          int    // number of gap-fill attempts (prevent infinite retry)
+	GapAttempts          int    // consecutive gap-fill errors or stalls (resets on progress)
+}
+
+// updateBootstrapState applies the state transition after a collection cycle.
+// Returns true if the namespace just completed bootstrap.
+func updateBootstrapState(state *nsBootstrapState, wasTrunc bool, oldestTS string) bool {
+	if state.Bootstrapped {
+		return false
+	}
+	if !wasTrunc {
+		state.Bootstrapped = true
+		state.OldestSeenCreationTS = ""
+		state.GapAttempts = 0
+		return true
+	}
+	if state.OldestSeenCreationTS == "" {
+		state.OldestSeenCreationTS = oldestTS
+	}
+	return false
+}
+
+// updateGapFillState applies state transitions after a gap-fill fetch.
+// Returns "completed" if bootstrap finished, "progressing" if the cursor
+// moved backward, or "stalled" if no progress was made.
+func updateGapFillState(state *nsBootstrapState, wasTrunc bool, oldestTS string) string {
+	if !wasTrunc {
+		state.Bootstrapped = true
+		state.OldestSeenCreationTS = ""
+		state.GapAttempts = 0
+		return "completed"
+	}
+	if isTimeBefore(oldestTS, state.OldestSeenCreationTS) {
+		state.OldestSeenCreationTS = oldestTS
+		state.GapAttempts = 0
+		return "progressing"
+	}
+	state.GapAttempts++
+	return "stalled"
+}
+
+// isTimeBefore parses two RFC3339 timestamps and returns true if a is before b.
+func isTimeBefore(a, b string) bool {
+	tA, _ := time.Parse(time.RFC3339, a)
+	tB, _ := time.Parse(time.RFC3339, b)
+	return tA.Before(tB)
+}
+
+// skipBreachNamespacesFromStates returns the set of namespaces that have not
+// completed their 30-day bootstrap. Breach evaluation is suppressed for these
+// namespaces to prevent false positives from partial data.
+func skipBreachNamespacesFromStates(states map[string]*nsBootstrapState) map[string]bool {
+	var skip map[string]bool
+	for ns, state := range states {
+		if !state.Bootstrapped && state.GapAttempts < maxGapFillAttempts {
+			if skip == nil {
+				skip = make(map[string]bool)
+			}
+			skip[ns] = true
+		}
+	}
+	return skip
 }
 
 // ── Retry configuration ───────────────────────────────────────────────────────
@@ -304,6 +364,7 @@ func NewKAExporter() (*KAExporter, error) {
 	fixedNS := strings.TrimSpace(os.Getenv(namespaceEnvVar))
 
 	var nsFilter *namespaceFilter
+	var sloConfig *SLOConfig
 	if configFile := strings.TrimSpace(os.Getenv(kaConfigFileEnv)); configFile != "" {
 		cfg, err := loadConfig(configFile)
 		if err != nil {
@@ -313,8 +374,16 @@ func NewKAExporter() (*KAExporter, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load config: %w", err)
 		}
+		sloConfig = cfg.CustomSLO
+		if sloConfig != nil {
+			sloConfig.Sanitize()
+		}
 		log.Printf("Namespace filter: loaded from %s (%d exact, %d pattern rules)",
 			configFile, len(nsFilter.exactMatches), len(nsFilter.patterns))
+		if sloConfig != nil {
+			log.Printf("Custom SLO config: loaded from %s", configFile)
+			logSLOOverrides(sloConfig)
+		}
 	} else {
 		nsFilter, _ = newNamespaceFilter(nil)
 		log.Printf("Namespace filter: no config file specified, no namespaces excluded")
@@ -408,9 +477,9 @@ func NewKAExporter() (*KAExporter, error) {
 	}
 
 	// Initialize 30d SLO metric modules
-	e.buildSLO = newBuildSLO30d()
-	e.integrationSLO = newIntegrationSLO30d()
-	e.releaseSLO = newReleaseSLO30d()
+	e.buildSLO = newBuildSLO30d(sloConfig)
+	e.integrationSLO = newIntegrationSLO30d(sloConfig)
+	e.releaseSLO = newReleaseSLO30d(sloConfig)
 
 	// Initialize rolling store (in-memory only, no persistence)
 	e.rollingStore = NewStore()

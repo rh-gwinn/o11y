@@ -67,7 +67,7 @@ Steady State Settings:
 **How It Works:**
 1. During cold start, if a namespace hits the 30K limit, mark it as "truncated" and record the oldest fetched timestamp
 2. Schedule a background gap-fill attempt with a narrower time window (query older data before the truncation point)
-3. Limit gap-fill to **5 attempts per namespace** to prevent infinite retries (total coverage up to 150K items)
+3. Limit gap-fill to **5 consecutive failures/stalls per namespace** to prevent infinite retries on persistently truncated namespaces. Successful gap-fills reset the counter, allowing further attempts
 4. Track gap-fill attempts and exhaustion via Prometheus counters
 
 **Trade-offs:**
@@ -89,7 +89,7 @@ Steady State Settings:
 type BootstrapState struct {
     Bootstrapped      bool      // Has 30-day window been populated?
     TruncatedAt       string    // Oldest timestamp if truncated
-    GapFillAttempts   int       // Number of gap-fill retries (max 5)
+    GapFillAttempts   int       // Consecutive gap-fill failures/stalls (max 5, resets on progress)
 }
 
 map[namespace]*BootstrapState
@@ -99,6 +99,7 @@ map[namespace]*BootstrapState
 - New namespace → Bootstrap with 720h query
 - Bootstrapped namespace → Steady-state 36h query
 - Truncated namespace → Schedule gap-fill with narrower window
+- Exhausted retries → Stop gap-fill, emit SLO breach metrics with available data
 - Decommissioned namespace → Remove from map to avoid wasted gap-fill attempts
 
 **Why This Matters:**
@@ -126,9 +127,10 @@ func (e *KAExporter) runCollection() {
     e.mu.Lock()
     defer e.mu.Unlock()
 
-    e.buildSLO.updateGauges(e.rollingStore)
-    e.integrationSLO.updateGauges(e.rollingStore)
-    e.releaseSLO.updateGauges(e.rollingStore)
+    skipBreach := skipBreachNamespacesFromStates(e.bootstrapStates)
+    e.buildSLO.updateGauges(e.rollingStore, skipBreach)
+    e.integrationSLO.updateGauges(e.rollingStore, skipBreach)
+    e.releaseSLO.updateGauges(e.rollingStore, skipBreach)
 }
 ```
 
@@ -165,12 +167,13 @@ func (e *KAExporter) Collect(ch chan<- prometheus.Metric) {
 **Data Structure:**
 ```go
 type DailyBucket struct {
-    Day               string           // "2026-06-23"
-    Count             int64            // Total completed (success + fail)
-    SuccessCount      int64            // Only successful
-    SuccessSumSeconds float64          // Duration sum (successful only)
-    WaitSumSeconds    float64          // Queue time sum (all completed)
-    FailureReasons    map[string]int64 // Failure count by reason
+    Day                      string           // "2026-06-23"
+    Count                    int64            // Total completed (success + fail)
+    SuccessCount             int64            // Only successful
+    SuccessSumSeconds        float64          // Duration sum (successful only)
+    SuccessSumSquaredSeconds float64          // Sum of squared durations (for stddev)
+    WaitSumSeconds           float64          // Queue time sum (successful only)
+    FailureReasons           map[string]int64 // Failure count by reason
 }
 
 type MetricWindow struct {
@@ -220,14 +223,15 @@ Typical deployment (500 label combinations):
 **Limitation:** Extremely busy namespaces with >30,000 PLRs in 30 days will be truncated during cold start.
 
 **Mitigations:**
-- Gap-fill mechanism retries with narrower time windows (up to 5 attempts = 150K total coverage)
+- Gap-fill mechanism retries with narrower time windows until the full 30-day range is covered
 - Truncation metrics track occurrences: `kaexporter_truncations_total{resource="pipelineruns"}`
 - Per-namespace bootstrap state prevents repeated failures
 
 **When This Happens:**
-- Typical namespace: ~100-500 PLRs/day → no issue
-- Busy namespace: 500-1,000 PLRs/day → may hit 30K limit over 30 days
-- Very busy namespace: >1,000 PLRs/day → gap-fill may also truncate (uses additional 5 attempts)
+- Typical namespace: ~100-500 PLRs/day -> no issue
+- Busy namespace: 500-1,000 PLRs/day -> may hit 30K cold-start cap over 30 days; gap-fill resolves this transparently
+- Very busy namespace: >1,000 PLRs/day -> truncates on cold start, gap-fill completes across multiple cycles
+- In steady state (36h window, 1,500 cap), truncation may occur for the busiest tenants but does not affect 30-day accuracy since data is already in the rolling store from bootstrap
 
 ---
 
@@ -292,9 +296,9 @@ err := e.collectMetrics(ctx) // Queries all namespaces in parallel
 ## Testing Strategy
 
 **Unit Tests:**
-- `metrics_test.go`: Observation recording, aggregation, deduplication
+- `metrics_test.go`: Observation recording, aggregation, deduplication, SLO breach evaluation, config override end-to-end, gap-fill breach suppression
+- `config_test.go`: YAML parsing, ThresholdValue unmarshaling, SLO config resolution cascade, sanitization
 - `ka_client_test.go`: HTTP retry logic, pagination handling
-- `rolling_store_test.go`: Bucket pruning, stale data eviction (NEW)
 
 **Integration Tests:**
 - End-to-end cold start simulation with mock KubeArchive API
